@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
-import face_recognition
 
 from .config import settings
 from .utils import (

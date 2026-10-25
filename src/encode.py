@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
 import numpy as np
 
 from .config import settings
@@ -23,17 +24,10 @@ from .utils import (
 CACHE_VERSION = 1
 
 
-def require_face_recognition():
-    """Import face_recognition only when dataset encoding work is requested."""
-
-    try:
-        import face_recognition
-    except ImportError as exc:
-        raise RuntimeError(
-            "face_recognition/dlib is not available in the current environment. "
-            "Use the Python 3.11 environment described in the README."
-        ) from exc
-    return face_recognition
+def load_image_rgb(path: str | Path) -> np.ndarray:
+    """Load an image file and return it as a contiguous RGB numpy array."""
+    with Image.open(path) as img:
+        return np.ascontiguousarray(np.array(img.convert("RGB"), dtype=np.uint8))
 
 
 @dataclass
@@ -104,7 +98,7 @@ class FaceEncodingStore:
     def build(self, force: bool = False, num_jitters: int = 1) -> EncodingBuildReport:
         """Build encodings only when the dataset changed unless forced."""
 
-        face_recognition = require_face_recognition()
+
         current_signature = dataset_signature(self.dataset_dir)
         current_cache = self.load_cache()
         if (
@@ -262,12 +256,11 @@ class FaceEncodingStore:
             people[person_name]["images"] += 1
 
         if deep:
-            face_recognition = require_face_recognition()
             for image_path in image_paths:
                 person_name = image_path.parent.name
                 relative_path = str(image_path.relative_to(self.dataset_dir))
                 try:
-                    image_rgb = face_recognition.load_image_file(str(image_path))
+                    image_rgb = load_image_rgb(image_path)
                     
                     # Ensure image is uint8 RGB as required by dlib
                     if image_rgb.dtype != np.uint8:

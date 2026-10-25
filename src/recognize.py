@@ -7,7 +7,6 @@ import time
 from dataclasses import dataclass
 
 import cv2
-import face_recognition
 import numpy as np
 
 from .attendance import AttendanceEvent, AttendanceLogger
