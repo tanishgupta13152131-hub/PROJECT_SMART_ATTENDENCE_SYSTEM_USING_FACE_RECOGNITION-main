@@ -173,22 +173,27 @@ def rgb_to_bgr(frame_rgb: np.ndarray) -> np.ndarray:
 
 
 def open_camera(camera_index: int = settings.camera_index):
-    """Open the specified webcam index using Mac-native backend."""
+    """Open the specified webcam index using OS-appropriate backend."""
+    import sys
     cv2 = require_cv2()
-    
-    # Use CAP_AVFOUNDATION for Mac (MUCH faster startup)
-    logger.info(f"Opening camera {camera_index} with AVFoundation...")
-    camera = cv2.VideoCapture(camera_index, cv2.CAP_AVFOUNDATION)
-    
+
+    # Select OS-optimized backend (CAP_DSHOW on Windows, CAP_AVFOUNDATION on Mac)
+    if sys.platform.startswith("win"):
+        camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    elif sys.platform.startswith("darwin"):
+        camera = cv2.VideoCapture(camera_index, cv2.CAP_AVFOUNDATION)
+    else:
+        camera = cv2.VideoCapture(camera_index)
+
     if not camera.isOpened():
-        # Fallback to default if AVFoundation fails
+        # Fallback to default backend
         camera = cv2.VideoCapture(camera_index)
         if not camera.isOpened():
             raise RuntimeError(f"Could not open camera {camera_index}")
 
     # Reduce buffer to keep feed real-time
     camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    
+
     return camera
 
 

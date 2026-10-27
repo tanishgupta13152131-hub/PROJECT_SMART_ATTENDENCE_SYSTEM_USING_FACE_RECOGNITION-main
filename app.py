@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -95,6 +97,23 @@ def import_face_recognizer():
     return FaceRecognizer
 
 
+def decode_image_file(file_obj) -> np.ndarray | None:
+    """Decode Streamlit uploaded or camera image to OpenCV BGR format."""
+    if file_obj is None:
+        return None
+    try:
+        cv2 = import_cv2()
+        bytes_data = file_obj.getvalue()
+        if not bytes_data:
+            return None
+        file_bytes = np.frombuffer(bytes_data, np.uint8)
+        frame_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        return frame_bgr
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Image decode error: {exc}")
+        return None
+
+
 def dashboard_page() -> None:
     st.title("Smart Attendance System")
 
@@ -145,208 +164,468 @@ def dashboard_page() -> None:
 def register_page() -> None:
     st.title("Register User")
 
-    col1, col2, col3 = st.columns([1.4, 0.8, 0.8])
-    person_name = col1.text_input("Name", placeholder="Example: Priya Sharma")
-    samples = col2.slider(
-        "Samples",
-        settings.minimum_samples_per_user,
-        settings.maximum_samples_per_user,
-        settings.default_samples_per_user,
+    capture_mode = st.radio(
+        "Capture Method",
+        [
+            "📸 Browser Camera (Webcam in Browser)",
+            "📁 Upload Images (Batch / Drag & Drop)",
+            "🖥️ Local / Server Camera (OpenCV)",
+        ],
+        horizontal=True,
     )
-    camera_index = col3.number_input("Camera", min_value=0, max_value=5, value=settings.camera_index)
 
-    frame_slot = st.empty()
-    status_slot = st.empty()
-    progress_slot = st.empty()
+    if capture_mode == "📸 Browser Camera (Webcam in Browser)":
+        col1, col2 = st.columns([1.3, 0.7])
+        person_name = col1.text_input("Name", placeholder="Example: Vansh Gupta")
+        samples_target = col2.number_input("Target Samples", min_value=5, max_value=50, value=25, step=5)
 
-    if st.button("Capture Samples", type="primary", use_container_width=True):
+        if not person_name.strip():
+            st.info("👆 Enter the person's name above to activate the camera.")
+            return
+
         try:
             safe_name = sanitize_person_name(person_name)
         except ValueError as exc:
             st.error(str(exc))
             return
 
-        try:
-            cv2 = import_cv2()
-            FaceRegistrar = import_face_registrar()
-            registrar = FaceRegistrar()
-        except Exception as exc:  # noqa: BLE001
-            show_runtime_error("Registration tools could not be loaded.", exc)
-            return
-
+        FaceRegistrar = import_face_registrar()
+        registrar = FaceRegistrar()
         existing_count = registrar.count_samples(safe_name)
-        target_count = existing_count + samples
-        progress = progress_slot.progress(0.0)
 
-        with st.spinner("Initializing camera..."):
+        col2.metric("Saved Samples", f"{existing_count}/{samples_target}")
+        progress = min(1.0, existing_count / max(samples_target, 1))
+        st.progress(progress)
+
+        next_pose = registrar.next_prompt(existing_count)
+        st.info(f"💡 Recommended pose for next photo: **{next_pose}**")
+
+        camera_file = st.camera_input(f"Take photo for {safe_name}", key=f"cam_{safe_name}")
+
+        if camera_file is not None:
+            img_bytes = camera_file.getvalue()
+            img_hash = hashlib.md5(img_bytes).hexdigest()
+            last_hash_key = f"last_hash_{safe_name}"
+
+            if st.session_state.get(last_hash_key) != img_hash:
+                frame_bgr = decode_image_file(camera_file)
+                if frame_bgr is not None:
+                    result = registrar.validate_and_save_frame(frame_bgr, safe_name)
+                    st.session_state[last_hash_key] = img_hash
+                    st.session_state[f"last_res_{safe_name}"] = result
+                    st.session_state[f"last_frame_{safe_name}"] = frame_bgr
+                    if result.saved:
+                        st.rerun()
+
+            last_res = st.session_state.get(f"last_res_{safe_name}")
+            last_frame = st.session_state.get(f"last_frame_{safe_name}")
+            if last_res:
+                if last_res.saved:
+                    st.success(f"✅ {last_res.message} (Total: {registrar.count_samples(safe_name)}/{samples_target})")
+                else:
+                    st.warning(f"⚠️ {last_res.message}")
+                if last_frame is not None and last_res.face_location:
+                    annotated = last_frame.copy()
+                    color = (40, 180, 80) if last_res.saved else (0, 180, 255)
+                    draw_face_box(annotated, last_res.face_location, last_res.status.replace("_", " ").title(), color)
+                    st.image(bgr_to_rgb(annotated), channels="RGB", use_container_width=True)
+
+        st.divider()
+        col_btn1, col_btn2 = st.columns([1, 1])
+        if col_btn1.button("⚡ Rebuild Encodings Now", type="primary", use_container_width=True):
+            store = FaceEncodingStore()
+            with st.spinner("Rebuilding face encodings..."):
+                report = store.build(force=True)
+                st.success(f"Trained model on {report.encoded_faces} faces across {report.people} people! Ready for attendance.")
+
+        if col_btn2.button("🔄 Clear Camera Photo Buffer", use_container_width=True):
+            st.session_state.pop(f"last_hash_{safe_name}", None)
+            st.rerun()
+
+    elif capture_mode == "📁 Upload Images (Batch / Drag & Drop)":
+        col1, col2 = st.columns([1.3, 0.7])
+        person_name = col1.text_input("Name", placeholder="Example: Vansh Gupta", key="upload_name")
+        auto_rebuild = col2.checkbox("Auto-rebuild model after saving", value=True)
+
+        uploaded_files = st.file_uploader(
+            "Upload 10-30 Face Photos / Selfies (JPEG/PNG)",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True,
+            help="Select multiple photos of the person from different angles for optimal recognition accuracy.",
+        )
+
+        if st.button("Process & Save Images", type="primary", use_container_width=True):
+            if not person_name.strip():
+                st.error("Please enter a person name before processing.")
+                return
+            if not uploaded_files:
+                st.warning("Please upload at least one image file.")
+                return
+
             try:
-                camera = open_camera(int(camera_index))
-            except RuntimeError as exc:
+                safe_name = sanitize_person_name(person_name)
+            except ValueError as exc:
                 st.error(str(exc))
                 return
 
-        last_capture = 0.0
-        start_time = time.time()
-        last_message = "Camera ready"
+            FaceRegistrar = import_face_registrar()
+            registrar = FaceRegistrar()
 
-        current_count = existing_count
-        try:
-            while current_count < target_count:
-                ok, frame = camera.read()
-                if not ok:
-                    st.error("Camera frame could not be read.")
-                    break
+            saved_count = 0
+            skipped_count = 0
+            progress_bar = st.progress(0.0)
 
-                now = time.time()
-                result = None
-                if now - last_capture >= settings.registration_capture_interval_sec:
-                    result = registrar.validate_and_save_frame(frame, safe_name)
-                    last_capture = now
-                    last_message = result.message
-                    if result and result.saved:
-                        current_count += 1
+            for idx, file_obj in enumerate(uploaded_files):
+                frame_bgr = decode_image_file(file_obj)
+                if frame_bgr is not None:
+                    result = registrar.validate_and_save_frame(frame_bgr, safe_name)
+                    if result.saved:
+                        saved_count += 1
+                    else:
+                        skipped_count += 1
+                progress_bar.progress((idx + 1) / len(uploaded_files))
 
-                annotated = frame.copy()
-                if result and result.face_location:
-                    color = (40, 180, 80) if result.saved else (0, 180, 255)
-                    draw_face_box(
+            total_now = registrar.count_samples(safe_name)
+            st.success(f"✅ Processed {len(uploaded_files)} images: Saved {saved_count} valid face samples! (Total: {total_now} samples for {safe_name}).")
+            if skipped_count > 0:
+                st.warning(f"⚠️ {skipped_count} images were skipped because no face or multiple faces were detected.")
+
+            if auto_rebuild and saved_count > 0:
+                store = FaceEncodingStore()
+                with st.spinner("Training model with new face samples..."):
+                    report = store.build(force=True)
+                    st.success(f"⚡ Encodings rebuilt! Encoded {report.encoded_faces} faces across {report.people} people. You can now take attendance.")
+
+    else:
+        # Local / Server OpenCV Camera
+        st.info("ℹ️ **Local Mode:** This mode directly accesses the webcam attached to the host machine via OpenCV. When running on Streamlit Cloud, please select **'📸 Browser Camera'** or **'📁 Upload Images'** above.")
+        col1, col2, col3 = st.columns([1.4, 0.8, 0.8])
+        person_name = col1.text_input("Name", placeholder="Example: Priya Sharma", key="local_person_name")
+        samples = col2.slider(
+            "Samples",
+            settings.minimum_samples_per_user,
+            settings.maximum_samples_per_user,
+            settings.default_samples_per_user,
+            key="local_samples",
+        )
+        camera_index = col3.number_input("Camera Index", min_value=0, max_value=5, value=settings.camera_index, key="local_cam_idx")
+
+        frame_slot = st.empty()
+        status_slot = st.empty()
+        progress_slot = st.empty()
+
+        if st.button("Capture Samples (Local OpenCV)", type="primary", use_container_width=True):
+            try:
+                safe_name = sanitize_person_name(person_name)
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+
+            try:
+                cv2 = import_cv2()
+                FaceRegistrar = import_face_registrar()
+                registrar = FaceRegistrar()
+            except Exception as exc:  # noqa: BLE001
+                show_runtime_error("Registration tools could not be loaded.", exc)
+                return
+
+            existing_count = registrar.count_samples(safe_name)
+            target_count = existing_count + samples
+            progress = progress_slot.progress(0.0)
+
+            with st.spinner("Initializing camera..."):
+                try:
+                    camera = open_camera(int(camera_index))
+                except RuntimeError as exc:
+                    st.error(f"{exc}. If running on Streamlit Cloud, switch to '📸 Browser Camera' above.")
+                    return
+
+            last_capture = 0.0
+            start_time = time.time()
+            last_message = "Camera ready"
+
+            current_count = existing_count
+            try:
+                while current_count < target_count:
+                    ok, frame = camera.read()
+                    if not ok:
+                        st.error("Camera frame could not be read.")
+                        break
+
+                    now = time.time()
+                    result = None
+                    if now - last_capture >= settings.registration_capture_interval_sec:
+                        result = registrar.validate_and_save_frame(frame, safe_name)
+                        last_capture = now
+                        last_message = result.message
+                        if result and result.saved:
+                            current_count += 1
+
+                    annotated = frame.copy()
+                    if result and result.face_location:
+                        color = (40, 180, 80) if result.saved else (0, 180, 255)
+                        draw_face_box(
+                            annotated,
+                            result.face_location,
+                            result.status.replace("_", " ").title(),
+                            color,
+                        )
+
+                    cv2.putText(
                         annotated,
-                        result.face_location,
-                        result.status.replace("_", " ").title(),
-                        color,
+                        f"{safe_name}: {current_count}/{target_count}",
+                        (16, 32),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.72,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
                     )
+                    cv2.putText(
+                        annotated,
+                        registrar.next_prompt(current_count),
+                        (16, 64),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.62,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    frame_slot.image(bgr_to_rgb(annotated), channels="RGB", use_container_width=True)
+                    progress.progress(min(1.0, (current_count - existing_count) / samples))
+                    status_slot.info(last_message)
 
-                cv2.putText(
-                    annotated,
-                    f"{safe_name}: {current_count}/{target_count}",
-                    (16, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.72,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    annotated,
-                    registrar.next_prompt(current_count),
-                    (16, 64),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.62,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                frame_slot.image(bgr_to_rgb(annotated), channels="RGB", use_container_width=True)
-                progress.progress(min(1.0, (current_count - existing_count) / samples))
-                status_slot.info(last_message)
+                    if time.time() - start_time > settings.registration_timeout_sec:
+                        st.warning("Registration timed out.")
+                        break
+                    time.sleep(0.01)
+            finally:
+                camera.release()
 
-                if time.time() - start_time > settings.registration_timeout_sec:
-                    st.warning("Registration timed out.")
-                    break
-                time.sleep(0.01)
-        finally:
-            camera.release()
-
-        final_count = registrar.count_samples(safe_name)
-        st.success(f"{safe_name} now has {final_count} dataset images.")
-        st.warning("Rebuild encodings before starting attendance.")
+            final_count = registrar.count_samples(safe_name)
+            st.success(f"{safe_name} now has {final_count} dataset images.")
+            st.warning("Rebuild encodings before starting attendance.")
 
 
 def attendance_page() -> None:
     st.title("Live Attendance")
 
-    col1, col2, col3, col4 = st.columns(4)
-    camera_index = col1.number_input("Camera", min_value=0, max_value=5, value=settings.camera_index)
-    storage = col2.selectbox("Storage", ["csv", "sqlite"], index=0)
-    duration = col3.slider("Session Seconds", 15, 600, 120, step=15)
-    threshold = col4.slider("Threshold", 0.45, 0.60, settings.recognition_threshold, step=0.01)
+    attendance_mode = st.radio(
+        "Attendance Mode",
+        [
+            "📸 Browser Camera (Cloud & Mobile)",
+            "📁 Upload Photo to Verify",
+            "🖥️ Local / Server Camera (Continuous Stream)",
+        ],
+        horizontal=True,
+    )
 
-    require_liveness = st.checkbox("Require Blink", value=False)
-    mark_probable = st.checkbox("Mark Probable Matches", value=False)
+    if attendance_mode == "📸 Browser Camera (Cloud & Mobile)":
+        col1, col2 = st.columns(2)
+        storage = col1.selectbox("Storage", ["csv", "sqlite"], index=0, key="att_storage_browser")
+        threshold = col2.slider("Distance Threshold", 40.0, 100.0, 85.0, step=1.0, key="att_thresh_browser", help="Lower is stricter, higher is more forgiving. Default is 85.0.")
 
-    frame_slot = st.empty()
-    result_slot = st.empty()
-    metric_slot = st.empty()
-
-    if st.button("Start Attendance Session", type="primary", use_container_width=True):
         try:
             FaceRecognizer = import_face_recognizer()
             attendance_logger = AttendanceLogger(storage=storage)  # type: ignore[arg-type]
             recognizer = FaceRecognizer(
                 attendance_logger=attendance_logger,
                 recognition_threshold=threshold,
-                require_liveness=require_liveness,
-                mark_probable=mark_probable,
             )
+            recognizer.lbph_threshold = float(threshold)
         except Exception as exc:  # noqa: BLE001
             show_runtime_error("Recognition tools could not be loaded.", exc)
             return
 
         if len(recognizer.label_to_name) == 0:
-            st.error("No known face encodings found. Register users and rebuild encodings first.")
+            st.warning("⚠️ No trained face model found. Please go to **Register User** to add faces and click 'Rebuild Encodings Now' first.")
             return
 
-        try:
-            cv2 = import_cv2()
-            camera = open_camera(int(camera_index))
-        except RuntimeError as exc:
-            st.error(str(exc))
-            return
+        st.caption(f"Registered users loaded: **{', '.join(sorted(set(recognizer.label_to_name.values())))}**")
 
-        start = time.time()
-        frame_count = 0
-        processed_count = 0
-        last_results = []
-
-        try:
-            while time.time() - start < duration:
-                ok, frame = camera.read()
-                if not ok:
-                    st.error("Camera frame could not be read.")
-                    break
-
-                frame_count += 1
-                if frame_count % settings.process_every_n_frames == 0:
-                    annotated, last_results = recognizer.recognize_frame(
-                        frame,
+        photo = st.camera_input("Scan Face for Attendance", key="browser_attendance_cam")
+        if photo is not None:
+            frame_bgr = decode_image_file(photo)
+            if frame_bgr is not None:
+                with st.spinner("Recognizing face..."):
+                    annotated, results = recognizer.recognize_frame(
+                        frame_bgr,
                         mark_attendance=True,
                         annotate=True,
                     )
-                    processed_count += 1
-                else:
-                    annotated = frame.copy()
-                    overlay_timestamp(annotated)
 
-                frame_slot.image(bgr_to_rgb(annotated), channels="RGB", use_container_width=True)
+                st.image(bgr_to_rgb(annotated), channels="RGB", use_container_width=True)
 
-                elapsed = max(time.time() - start, 1e-6)
-                fps = frame_count / elapsed
-                metric_slot.metric("Live FPS", f"{fps:.1f}", f"processed {processed_count}")
+                if results:
+                    for item in results:
+                        if item.classification == "Valid" and item.name != "Unknown":
+                            if item.attendance_event and item.attendance_event.status == "marked":
+                                st.success(f"🎉 **Attendance Marked!** Welcome, **{item.name}**! (Confidence: {item.confidence:.1f}%)")
+                            else:
+                                reason = item.attendance_event.reason if item.attendance_event else "Recent attendance already logged"
+                                st.info(f"ℹ️ **{item.name}** recognized ({item.confidence:.1f}%). {reason}")
+                        else:
+                            st.error(f"❌ Unrecognized face (Distance: {item.distance:.1f} vs threshold {threshold:.1f}). Make sure you are registered and encodings are rebuilt.")
 
-                if last_results:
-                    result_slot.dataframe(
+                    st.dataframe(
                         pd.DataFrame(
                             [
                                 {
-                                    "name": item.name,
-                                    "confidence": item.confidence,
-                                    "class": item.classification,
-                                    "distance": item.distance,
-                                    "attendance": item.attendance_event.reason
-                                    if item.attendance_event
-                                    else "",
+                                    "Name": item.name,
+                                    "Confidence (%)": f"{item.confidence:.1f}%",
+                                    "Class": item.classification,
+                                    "Distance": f"{item.distance:.1f}" if item.distance is not None else "N/A",
+                                    "Status": item.attendance_event.reason if item.attendance_event else "Logged",
                                 }
-                                for item in last_results
+                                for item in results
                             ]
                         ),
                         use_container_width=True,
                         hide_index=True,
                     )
-                time.sleep(0.01)
-        finally:
-            camera.release()
+                else:
+                    st.warning("⚠️ No face detected in the photo. Please center your face in good lighting and try again.")
 
-        st.success("Attendance session ended.")
+    elif attendance_mode == "📁 Upload Photo to Verify":
+        col1, col2 = st.columns(2)
+        storage = col1.selectbox("Storage", ["csv", "sqlite"], index=0, key="att_storage_upload")
+        threshold = col2.slider("Distance Threshold", 40.0, 100.0, 85.0, step=1.0, key="att_thresh_upload")
+
+        try:
+            FaceRecognizer = import_face_recognizer()
+            attendance_logger = AttendanceLogger(storage=storage)  # type: ignore[arg-type]
+            recognizer = FaceRecognizer(
+                attendance_logger=attendance_logger,
+                recognition_threshold=threshold,
+            )
+            recognizer.lbph_threshold = float(threshold)
+        except Exception as exc:  # noqa: BLE001
+            show_runtime_error("Recognition tools could not be loaded.", exc)
+            return
+
+        if len(recognizer.label_to_name) == 0:
+            st.warning("⚠️ No trained face model found. Please go to **Register User** first.")
+            return
+
+        uploaded_photo = st.file_uploader("Upload Image to Mark Attendance", type=["jpg", "jpeg", "png"], key="upload_att_file")
+        if uploaded_photo is not None:
+            frame_bgr = decode_image_file(uploaded_photo)
+            if frame_bgr is not None:
+                with st.spinner("Processing image..."):
+                    annotated, results = recognizer.recognize_frame(
+                        frame_bgr,
+                        mark_attendance=True,
+                        annotate=True,
+                    )
+                st.image(bgr_to_rgb(annotated), channels="RGB", use_container_width=True)
+                if results:
+                    for item in results:
+                        if item.classification == "Valid" and item.name != "Unknown":
+                            if item.attendance_event and item.attendance_event.status == "marked":
+                                st.success(f"🎉 **Attendance Marked!** Welcome, **{item.name}**! (Confidence: {item.confidence:.1f}%)")
+                            else:
+                                reason = item.attendance_event.reason if item.attendance_event else "Recent attendance already logged"
+                                st.info(f"ℹ️ **{item.name}**: {reason}")
+                        else:
+                            st.error(f"❌ Face unrecognized or confidence too low ({item.distance:.1f} vs {threshold:.1f}).")
+                else:
+                    st.warning("⚠️ No face detected in the uploaded photo.")
+
+    else:
+        st.info("ℹ️ **Local Mode:** Continuous OpenCV streaming requires running on a computer with a local webcam plugged in. On Streamlit Cloud, use **'📸 Browser Camera'** above.")
+        col1, col2, col3, col4 = st.columns(4)
+        camera_index = col1.number_input("Camera", min_value=0, max_value=5, value=settings.camera_index, key="local_att_cam")
+        storage = col2.selectbox("Storage", ["csv", "sqlite"], index=0, key="local_att_storage")
+        duration = col3.slider("Session Seconds", 15, 600, 120, step=15, key="local_att_duration")
+        threshold = col4.slider("Threshold", 40.0, 100.0, 85.0, step=1.0, key="local_att_threshold")
+
+        require_liveness = st.checkbox("Require Blink", value=False, key="local_att_blink")
+        mark_probable = st.checkbox("Mark Probable Matches", value=False, key="local_att_prob")
+
+        frame_slot = st.empty()
+        result_slot = st.empty()
+        metric_slot = st.empty()
+
+        if st.button("Start Attendance Session (OpenCV)", type="primary", use_container_width=True):
+            try:
+                FaceRecognizer = import_face_recognizer()
+                attendance_logger = AttendanceLogger(storage=storage)  # type: ignore[arg-type]
+                recognizer = FaceRecognizer(
+                    attendance_logger=attendance_logger,
+                    recognition_threshold=threshold,
+                    require_liveness=require_liveness,
+                    mark_probable=mark_probable,
+                )
+                recognizer.lbph_threshold = float(threshold)
+            except Exception as exc:  # noqa: BLE001
+                show_runtime_error("Recognition tools could not be loaded.", exc)
+                return
+
+            if len(recognizer.label_to_name) == 0:
+                st.error("No known face encodings found. Register users and rebuild encodings first.")
+                return
+
+            try:
+                cv2 = import_cv2()
+                camera = open_camera(int(camera_index))
+            except RuntimeError as exc:
+                st.error(f"{exc}. If running on Streamlit Cloud, switch to '📸 Browser Camera' above.")
+                return
+
+            start = time.time()
+            frame_count = 0
+            processed_count = 0
+            last_results = []
+
+            try:
+                while time.time() - start < duration:
+                    ok, frame = camera.read()
+                    if not ok:
+                        st.error("Camera frame could not be read.")
+                        break
+
+                    frame_count += 1
+                    if frame_count % settings.process_every_n_frames == 0:
+                        annotated, last_results = recognizer.recognize_frame(
+                            frame,
+                            mark_attendance=True,
+                            annotate=True,
+                        )
+                        processed_count += 1
+                    else:
+                        annotated = frame.copy()
+                        overlay_timestamp(annotated)
+
+                    frame_slot.image(bgr_to_rgb(annotated), channels="RGB", use_container_width=True)
+
+                    elapsed = max(time.time() - start, 1e-6)
+                    fps = frame_count / elapsed
+                    metric_slot.metric("Live FPS", f"{fps:.1f}", f"processed {processed_count}")
+
+                    if last_results:
+                        result_slot.dataframe(
+                            pd.DataFrame(
+                                [
+                                    {
+                                        "name": item.name,
+                                        "confidence": item.confidence,
+                                        "class": item.classification,
+                                        "distance": item.distance,
+                                        "attendance": item.attendance_event.reason
+                                        if item.attendance_event
+                                        else "",
+                                    }
+                                    for item in last_results
+                                ]
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    time.sleep(0.01)
+            finally:
+                camera.release()
+
+            st.success("Attendance session ended.")
 
 
 def logs_page() -> None:
